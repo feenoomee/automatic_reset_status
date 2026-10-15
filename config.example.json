@@ -1,8 +1,4 @@
 {
-  "spreadsheet_id": "1wZ4w8WEQB5B_zQSW5OuATNwmmbJrSX8bSJcuCjkhnHo",
-  "index_sheet": "Главная страница",
   "credentials_path": "credentials.json",
-  "status_headers": ["Чек", "Чеклист", "Чек-лист"],
-  "reset_from": ["pass", "fail"],
   "reset_to": "test"
 }

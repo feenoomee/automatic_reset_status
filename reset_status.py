@@ -1,7 +1,7 @@
-"""Сброс статусов чеклистов Google Sheets в `test`.
+"""Сброс полей чеклистов Google Sheets.
 
-Скрипт читает сводную вкладку, проходит по гиперссылкам из первой колонки
-на вкладки того же документа и меняет статусы pass/fail на test.
+Скрипт проходит по всем вкладкам таблицы и сбрасывает поля по их типу:
+галочку снимает, в выпадающем списке ставит значение из конфига.
 """
 
 from __future__ import annotations
@@ -12,25 +12,23 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-HEADER_SEARCH_ROWS = 5
 SPREADSHEET_URL_RE = re.compile(r"/spreadsheets/d/([a-zA-Z0-9-_]+)")
-GID_RE = re.compile(r"[#&?]gid=(\d+)")
-HYPERLINK_FORMULA_RE = re.compile(r'HYPERLINK\(\s*"([^"]+)"', re.IGNORECASE)
 
 DEFAULTS = {
-    "index_sheet": "Чеклисты",
     "credentials_path": "credentials.json",
-    "status_headers": ["Статус", "Чеклист", "Status"],
-    "reset_from": ["pass", "fail"],
     "reset_to": "test",
 }
+CHECKBOX = "BOOLEAN"
+DROPDOWNS = {"ONE_OF_LIST", "ONE_OF_RANGE"}
+TABLE_DROPDOWN = "DROPDOWN"
+CHECKED_TEXT = {"true", "истина"}
 
 
 class ConfigError(Exception):
@@ -40,20 +38,18 @@ class ConfigError(Exception):
 @dataclass
 class Config:
     spreadsheet_id: str
-    index_sheet: str
     credentials_path: Path
-    status_headers: list[str]
-    reset_from: list[str]
     reset_to: str
 
 
-@dataclass
-class SheetLink:
-    """Ссылка на вкладку из сводного списка."""
+@dataclass(frozen=True)
+class ColumnSpan:
+    """Колонка таблицы Google Sheets: чекбокс или выпадающий список."""
 
-    title: str
-    gid: int
-    label: str
+    start_row: int
+    end_row: int
+    kind: str
+    condition: dict
 
 
 def normalize(value: object) -> str:
@@ -65,18 +61,24 @@ def extract_spreadsheet_id(raw: str) -> str:
     return match.group(1) if match else raw.strip()
 
 
-def load_config(config_path: Path, spreadsheet_override: str | None) -> Config:
+def ask_spreadsheet() -> str:
+    """Просит вставить ссылку на таблицу в консоли."""
+    try:
+        return input("Ссылка на таблицу: ").strip()
+    except EOFError:
+        return ""
+
+
+def load_config(config_path: Path, spreadsheet_raw: str) -> Config:
     if not config_path.exists():
         raise ConfigError(
-            f"Не найден {config_path}. Скопируй config.example.json в {config_path.name} "
-            "и заполни spreadsheet_id."
+            f"Не найден {config_path}. Скопируй config.example.json в {config_path.name}."
         )
 
     raw = json.loads(config_path.read_text(encoding="utf-8"))
-    spreadsheet_raw = spreadsheet_override or raw.get("spreadsheet_id", "")
     spreadsheet_id = extract_spreadsheet_id(spreadsheet_raw)
     if not spreadsheet_id:
-        raise ConfigError("В конфиге не задан spreadsheet_id.")
+        raise ConfigError("Нужна ссылка на таблицу.")
 
     credentials_path = Path(raw.get("credentials_path", DEFAULTS["credentials_path"]))
     if not credentials_path.is_absolute():
@@ -89,10 +91,7 @@ def load_config(config_path: Path, spreadsheet_override: str | None) -> Config:
 
     return Config(
         spreadsheet_id=spreadsheet_id,
-        index_sheet=raw.get("index_sheet", DEFAULTS["index_sheet"]),
         credentials_path=credentials_path,
-        status_headers=raw.get("status_headers", DEFAULTS["status_headers"]),
-        reset_from=raw.get("reset_from", DEFAULTS["reset_from"]),
         reset_to=raw.get("reset_to", DEFAULTS["reset_to"]),
     )
 
@@ -118,189 +117,234 @@ def column_letter(index: int) -> str:
     return letters
 
 
-def fetch_sheet_titles(service, spreadsheet_id: str) -> dict[int, str]:
-    response = (
-        service.spreadsheets()
-        .get(spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)")
-        .execute()
-    )
-    return {
-        sheet["properties"]["sheetId"]: sheet["properties"]["title"]
-        for sheet in response.get("sheets", [])
-    }
-
-
-def cell_link(cell: dict) -> str | None:
-    """Гиперссылка ячейки: cell link, rich text или формула HYPERLINK."""
-    if cell.get("hyperlink"):
-        return cell["hyperlink"]
-
-    for run in cell.get("textFormatRuns", []):
-        uri = run.get("format", {}).get("link", {}).get("uri")
-        if uri:
-            return uri
-
-    formula = cell.get("userEnteredValue", {}).get("formulaValue", "")
-    match = HYPERLINK_FORMULA_RE.search(formula)
-    return match.group(1) if match else None
-
-
-def collect_links(
-    service, config: Config, sheet_titles: dict[int, str]
-) -> tuple[list[SheetLink], list[str]]:
-    """Достаёт ссылки на вкладки из первой колонки сводного листа."""
+def fetch_sheet_titles(service, spreadsheet_id: str) -> list[str]:
+    """Все вкладки-сетки таблицы по порядку, включая скрытые."""
     response = (
         service.spreadsheets()
         .get(
-            spreadsheetId=config.spreadsheet_id,
-            ranges=[f"{quote_sheet(config.index_sheet)}!A:A"],
-            includeGridData=True,
-            fields=(
-                "sheets(data(rowData(values("
-                "hyperlink,formattedValue,userEnteredValue,textFormatRuns))))"
-            ),
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties(title,sheetType)",
         )
         .execute()
     )
-
-    sheets = response.get("sheets", [])
-    if not sheets:
-        raise ConfigError(f"Вкладка «{config.index_sheet}» не найдена в таблице.")
-
-    rows = sheets[0].get("data", [{}])[0].get("rowData", [])
-    links: list[SheetLink] = []
-    skipped: list[str] = []
-    seen_gids: set[int] = set()
-
-    for row in rows:
-        values = row.get("values", [])
-        if not values:
-            continue
-        cell = values[0]
-        label = cell.get("formattedValue", "").strip()
-        url = cell_link(cell)
-        if not url:
-            continue
-
-        target_id = extract_spreadsheet_id(url)
-        if target_id and target_id != config.spreadsheet_id and "/spreadsheets/d/" in url:
-            skipped.append(f"{label or url}: ссылка на другую таблицу")
-            continue
-
-        gid_match = GID_RE.search(url)
-        if not gid_match:
-            skipped.append(f"{label or url}: в ссылке нет gid")
-            continue
-
-        gid = int(gid_match.group(1))
-        if gid in seen_gids:
-            continue
-
-        title = sheet_titles.get(gid)
-        if title is None:
-            skipped.append(f"{label or url}: вкладка с gid={gid} не найдена")
-            continue
-
-        seen_gids.add(gid)
-        links.append(SheetLink(title=title, gid=gid, label=label or title))
-
-    return links, skipped
+    return [
+        sheet["properties"]["title"]
+        for sheet in response.get("sheets", [])
+        if sheet["properties"].get("sheetType", "GRID") == "GRID"
+    ]
 
 
-def find_status_column(grid: Sequence[Sequence[str]], headers: Iterable[str]) -> tuple[int, int] | None:
-    """Возвращает (индекс строки заголовка, индекс колонки статуса)."""
-    wanted = {normalize(header) for header in headers}
-    for row_index, row in enumerate(grid[:HEADER_SEARCH_ROWS]):
-        for col_index, value in enumerate(row):
-            if normalize(value) in wanted:
-                return row_index, col_index
+def validation_type(cell: dict | None) -> str | None:
+    if not cell:
+        return None
+    condition = (cell.get("dataValidation") or {}).get("condition") or {}
+    return condition.get("type")
+
+
+def column_spans(tables: Sequence[dict]) -> dict[int, list[ColumnSpan]]:
+    """Колонки таблиц, у которых тип поля задан на всю колонку, а не на ячейку."""
+    spans: dict[int, list[ColumnSpan]] = {}
+    for table in tables:
+        grid_range = table.get("range") or {}
+        origin_col = grid_range.get("startColumnIndex", 0)
+        start_row = grid_range.get("startRowIndex", 0) + 1
+        end_row = grid_range.get("endRowIndex", start_row)
+        for column in table.get("columnProperties") or []:
+            kind = column.get("columnType")
+            if kind not in {CHECKBOX, TABLE_DROPDOWN}:
+                continue
+            sheet_col = origin_col + column.get("columnIndex", 0)
+            condition = (column.get("dataValidationRule") or {}).get("condition") or {}
+            spans.setdefault(sheet_col, []).append(
+                ColumnSpan(start_row, end_row, kind, condition)
+            )
+    return spans
+
+
+def span_at(spans: dict[int, list[ColumnSpan]], row: int, col: int) -> ColumnSpan | None:
+    for span in spans.get(col, []):
+        if span.start_row <= row < span.end_row:
+            return span
+    return None
+
+
+def entered_text(cell: dict) -> str:
+    entered = cell.get("userEnteredValue") or {}
+    if "stringValue" in entered:
+        return str(entered["stringValue"]).strip()
+    if "numberValue" in entered:
+        return str(entered["numberValue"]).strip()
+    if "boolValue" in entered:
+        return "TRUE" if entered["boolValue"] else "FALSE"
+    return str(cell.get("formattedValue") or "").strip()
+
+
+def planned_reset(
+    cell: dict | None, reset_to: str, span: ColumnSpan | None = None
+) -> tuple[str, object] | None:
+    """Что записать в ячейку, если её поле нужно сбросить.
+
+    Чекбокс со галочкой -> снятая галочка.
+    Выпадающий список с выбранным значением -> reset_to.
+    Пустые поля и обычный текст не трогаем.
+    Тип может быть у самой ячейки или у колонки таблицы.
+    """
+    if cell is None and span is None:
+        return None
+    cell = cell or {}
+    if "formulaValue" in (cell.get("userEnteredValue") or {}):
+        return None
+
+    kind = validation_type(cell)
+    condition = (cell.get("dataValidation") or {}).get("condition") or {}
+    if kind is None and span is not None:
+        kind = "ONE_OF_LIST" if span.kind == TABLE_DROPDOWN else CHECKBOX
+        condition = span.condition or condition
+
+    if kind == CHECKBOX:
+        custom = condition.get("values") or []
+        if len(custom) >= 2:
+            checked = str(custom[0].get("userEnteredValue", "")).strip()
+            unchecked = custom[1].get("userEnteredValue", "")
+            current = entered_text(cell)
+            if not current or not checked or normalize(current) != normalize(checked):
+                return None
+            return "checkbox", unchecked
+
+        entered = cell.get("userEnteredValue") or {}
+        if "boolValue" in entered:
+            if entered["boolValue"]:
+                return "checkbox", False
+            return None
+        if normalize(cell.get("formattedValue")) in CHECKED_TEXT:
+            return "checkbox", False
+        return None
+
+    if kind in DROPDOWNS:
+        current = entered_text(cell)
+        if not current or normalize(current) == normalize(reset_to):
+            return None
+        return "dropdown", reset_to
+
     return None
 
 
 def build_updates(
-    sheet_title: str, grid: Sequence[Sequence[str]], config: Config
-) -> list[dict]:
-    """Готовит ValueRange на каждый непрерывный блок ячеек pass/fail."""
-    found = find_status_column(grid, config.status_headers)
-    if found is None:
-        return []
-
-    header_row, status_col = found
-    reset_from = {normalize(value) for value in config.reset_from}
-    letter = column_letter(status_col)
-
+    sheet_title: str,
+    grid: Sequence[Sequence[dict]],
+    reset_to: str,
+    tables: Sequence[dict] = (),
+) -> tuple[list[dict], int, int]:
+    """Готовит диапазоны сброса по типу поля в ячейке или колонке таблицы."""
+    spans = column_spans(tables)
+    width = max((len(row) for row in grid), default=0)
+    if spans:
+        width = max(width, max(spans) + 1)
     updates: list[dict] = []
-    block_start: int | None = None
+    checkbox_cells = 0
+    dropdown_cells = 0
 
-    def flush(end_row: int) -> None:
-        nonlocal block_start
-        if block_start is None:
-            return
-        first = block_start + 1
-        last = end_row + 1
-        updates.append(
-            {
-                "range": f"{quote_sheet(sheet_title)}!{letter}{first}:{letter}{last}",
-                "values": [[config.reset_to] for _ in range(first, last + 1)],
-            }
-        )
-        block_start = None
+    for col in range(width):
+        letter = column_letter(col)
+        block_start: int | None = None
+        block_value: object = None
+        block_kind: str | None = None
 
-    for row_index in range(header_row + 1, len(grid)):
-        row = grid[row_index]
-        value = row[status_col] if status_col < len(row) else ""
-        if normalize(value) in reset_from:
-            if block_start is None:
-                block_start = row_index
-        else:
-            flush(row_index - 1)
+        def flush(end_row: int) -> None:
+            nonlocal block_start, block_value, block_kind, checkbox_cells, dropdown_cells
+            if block_start is None or block_kind is None:
+                return
+            first = block_start + 1
+            last = end_row + 1
+            count = last - first + 1
+            updates.append(
+                {
+                    "range": f"{quote_sheet(sheet_title)}!{letter}{first}:{letter}{last}",
+                    "values": [[block_value] for _ in range(count)],
+                }
+            )
+            if block_kind == "checkbox":
+                checkbox_cells += count
+            else:
+                dropdown_cells += count
+            block_start = None
+            block_value = None
+            block_kind = None
 
-    flush(len(grid) - 1)
-    return updates
+        for row_index, row in enumerate(grid):
+            cell = row[col] if col < len(row) else None
+            planned = planned_reset(cell, reset_to, span_at(spans, row_index, col))
+            if planned is not None and (
+                block_start is None or (planned[0] == block_kind and planned[1] == block_value)
+            ):
+                if block_start is None:
+                    block_start = row_index
+                    block_kind, block_value = planned
+            else:
+                flush(row_index - 1)
+                if planned is not None:
+                    block_start = row_index
+                    block_kind, block_value = planned
+
+        flush(len(grid) - 1)
+
+    return updates, checkbox_cells, dropdown_cells
 
 
 def fetch_grids(
     service, spreadsheet_id: str, titles: Sequence[str]
-) -> dict[str, list[list[str]]]:
-    response = (
-        service.spreadsheets()
-        .values()
-        .batchGet(
-            spreadsheetId=spreadsheet_id,
-            ranges=[quote_sheet(title) for title in titles],
-            majorDimension="ROWS",
-        )
-        .execute()
+) -> dict[str, tuple[list[list[dict]], list[dict]]]:
+    """Читает ячейки и колонки таблиц: чекбокс или выпадающий список."""
+    grids: dict[str, tuple[list[list[dict]], list[dict]]] = {}
+    fields = (
+        "sheets(properties(title),tables(range,columnProperties("
+        "columnIndex,columnType,dataValidationRule)),data(rowData(values("
+        "formattedValue,userEnteredValue,dataValidation))))"
     )
-    return {
-        title: value_range.get("values", [])
-        for title, value_range in zip(titles, response.get("valueRanges", []))
-    }
+    for offset in range(0, len(titles), 5):
+        chunk = titles[offset : offset + 5]
+        response = (
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                ranges=[quote_sheet(title) for title in chunk],
+                includeGridData=True,
+                fields=fields,
+            )
+            .execute()
+        )
+        for sheet in response.get("sheets", []):
+            title = sheet.get("properties", {}).get("title")
+            data = sheet.get("data") or [{}]
+            rows = data[0].get("rowData", [])
+            grids[title] = (
+                [row.get("values", []) for row in rows],
+                sheet.get("tables") or [],
+            )
+    return grids
 
 
 def run(config: Config) -> int:
     service = build_service(config.credentials_path)
-    sheet_titles = fetch_sheet_titles(service, config.spreadsheet_id)
-    links, skipped = collect_links(service, config, sheet_titles)
-
-    print(f"Найдено чеклистов по ссылкам: {len(links)}")
-    for note in skipped:
-        print(f"  пропуск -> {note}")
-
-    targets = [config.index_sheet] + [
-        link.title for link in links if link.title != config.index_sheet
-    ]
+    targets = fetch_sheet_titles(service, config.spreadsheet_id)
+    print(f"Вкладок в таблице: {len(targets)}")
     grids = fetch_grids(service, config.spreadsheet_id, targets)
 
     data: list[dict] = []
     total_cells = 0
     for title in targets:
-        updates = build_updates(title, grids.get(title, []), config)
-        cells = sum(len(update["values"]) for update in updates)
+        rows, tables = grids.get(title, ([], []))
+        updates, checks, dropdowns = build_updates(title, rows, config.reset_to, tables)
+        cells = checks + dropdowns
         if cells:
             data.extend(updates)
             total_cells += cells
-            print(f"  {title}: {cells} ячеек -> {config.reset_to}")
+            parts = []
+            if checks:
+                parts.append(f"снято галочек: {checks}")
+            if dropdowns:
+                parts.append(f"списков -> {config.reset_to}: {dropdowns}")
+            print(f"  {title}: {', '.join(parts)}")
         else:
             print(f"  {title}: изменений нет")
 
@@ -313,12 +357,14 @@ def run(config: Config) -> int:
         body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
 
-    print(f"Готово: {total_cells} ячеек сброшено в {config.reset_to}.")
+    print(f"Готово: сброшено ячеек — {total_cells}.")
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Сброс статусов чеклистов в test")
+    parser = argparse.ArgumentParser(
+        description="Сброс чекбоксов и выпадающих списков в чеклистах"
+    )
     parser.add_argument(
         "--config",
         default=str(Path(__file__).with_name("config.json")),
@@ -326,7 +372,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--spreadsheet",
-        help="ID или URL таблицы, перекрывает значение из конфига",
+        help="ссылка или ID таблицы; без этого аргумента скрипт спросит её сам",
     )
     args = parser.parse_args(argv)
 
@@ -335,7 +381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
     try:
-        config = load_config(Path(args.config), args.spreadsheet)
+        spreadsheet = (args.spreadsheet or "").strip() or ask_spreadsheet()
+        config = load_config(Path(args.config), spreadsheet)
         return run(config)
     except ConfigError as error:
         print(f"Ошибка: {error}", file=sys.stderr)

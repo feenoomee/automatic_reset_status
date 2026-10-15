@@ -1,15 +1,24 @@
 # Сброс статусов чеклистов в `test`
 
-Скрипт читает сводную вкладку Google-таблицы, проходит по гиперссылкам из колонки «Название»
-на вкладки внутри того же документа и сбрасывает статусы `pass`/`fail` в `test` —
-как в самих чеклистах, так и в колонке статуса сводной вкладки.
+Скрипт проходит по всем вкладкам Google-таблицы, включая скрытые, и сбрасывает поля по их типу:
+галочку снимает, в выпадающем списке ставит значение из `reset_to`.
+Ссылки, названия вкладок и сводная страница не важны — подходит любая таблица.
+Так же обрабатываются колонки таблиц Google Sheets с типом «галочка» или «выпадающий список»:
+у них тип задан на всю колонку. Обычный текст не меняется.
 
 ## Установка
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Активировать окружение не обязательно: `reset_status.bat` сам берёт Python из `.venv`.
+Если хочется `Activate.ps1`, а PowerShell пишет «выполнение сценариев отключено»,
+разреши скрипты для своего пользователя:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
 
 ## Доступ к таблице
@@ -32,20 +41,18 @@ copy config.example.json config.json
 
 | Поле | Описание |
 | --- | --- |
-| `spreadsheet_id` | ID таблицы из URL: `docs.google.com/spreadsheets/d/<ID>/edit` |
-| `index_sheet` | Имя сводной вкладки со списком чеклистов и ссылками |
 | `credentials_path` | Путь к JSON-ключу service account |
-| `status_headers` | Заголовки, по которым ищется колонка статуса |
-| `reset_from` | Значения, которые нужно сбрасывать (регистр не важен) |
-| `reset_to` | Значение, на которое меняем |
+| `reset_to` | Что записать в выпадающий список. У чекбокса галочка просто снимается |
 
 ## Запуск
 
 ```powershell
-python reset_status.py
+.venv\Scripts\python.exe reset_status.py
 ```
 
-Опционально:
+Или двойной клик по `reset_status.bat`. Скрипт спросит ссылку. Вставь URL таблицы и нажми Enter.
+
+Опционально ссылку можно передать сразу, без запроса:
 
 ```powershell
 python reset_status.py --config other-config.json
@@ -57,7 +64,7 @@ python reset_status.py --spreadsheet https://docs.google.com/spreadsheets/d/<ID>
 
 ## Проверка логики без доступа к таблице
 
-`selfcheck.py` прогоняет разбор ссылок, поиск колонки статуса и сборку диапазонов
+`selfcheck.py` прогоняет разбор ссылки на таблицу и сборку диапазонов по типу поля
 на синтетических данных — доступ в Google не нужен:
 
 ```powershell
